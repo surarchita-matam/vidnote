@@ -2,7 +2,7 @@
 
 A full-stack web app for uploading, annotating, and AI-summarizing videos.
 
-**Live demo:** _add deployed URL here_
+**Live demo:** https://vidnote-steel.vercel.app/
 **Stack:** Next.js 16 (App Router) · React 19 · TypeScript · Tailwind v4 · Prisma · Postgres · AWS S3 · NextAuth (Google OAuth) · pluggable LLM (Anthropic / OpenAI / Groq)
 
 ---
