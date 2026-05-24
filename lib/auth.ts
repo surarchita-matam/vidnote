@@ -12,7 +12,11 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
       allowDangerousEmailAccountLinking: true,
     }),
   ],
-  session: { strategy: "database" },
+  session: {
+    strategy: "database",
+    maxAge: 24 * 60 * 60,
+    updateAge: 60 * 60,
+  },
   pages: { signIn: "/login" },
   callbacks: {
     session({ session, user }) {
