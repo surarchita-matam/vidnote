@@ -1,8 +1,19 @@
 "use client";
 
 import * as React from "react";
-import { Loader2, Plus, Sparkles, Trash2 } from "lucide-react";
+import Link from "next/link";
+import { useRouter } from "next/navigation";
+import { ArrowLeft, Loader2, Plus, Sparkles, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -34,6 +45,7 @@ interface Props {
 }
 
 export function VideoWorkspace({ video, initialAnnotations, playbackUrl }: Props) {
+  const router = useRouter();
   const videoRef = React.useRef<HTMLVideoElement | null>(null);
   const [annotations, setAnnotations] = React.useState<Annotation[]>(initialAnnotations);
   const [currentTime, setCurrentTime] = React.useState(0);
@@ -42,6 +54,27 @@ export function VideoWorkspace({ video, initialAnnotations, playbackUrl }: Props
   const [summary, setSummary] = React.useState<string | null>(video.summary);
   const [summaryBusy, setSummaryBusy] = React.useState(false);
   const [summaryError, setSummaryError] = React.useState<string | null>(null);
+  const [confirmOpen, setConfirmOpen] = React.useState(false);
+  const [deleting, setDeleting] = React.useState(false);
+  const [deleteError, setDeleteError] = React.useState<string | null>(null);
+
+  async function handleDelete() {
+    setDeleting(true);
+    setDeleteError(null);
+    try {
+      const res = await fetch(`/api/videos/${video.id}`, { method: "DELETE" });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || "Failed to delete video");
+      }
+      setConfirmOpen(false);
+      router.push("/");
+      router.refresh();
+    } catch (err) {
+      setDeleteError(err instanceof Error ? err.message : "Failed to delete video");
+      setDeleting(false);
+    }
+  }
 
   const timestampAnnotations = React.useMemo(
     () => annotations.filter((a) => a.kind === "timestamp").sort((a, b) => a.timestamp - b.timestamp),
@@ -149,18 +182,80 @@ export function VideoWorkspace({ video, initialAnnotations, playbackUrl }: Props
   return (
     <div className="grid gap-6 lg:grid-cols-[2fr_1fr]">
       <div className="space-y-4">
-        <h1 className="text-2xl font-semibold tracking-tight">{video.name}</h1>
+        <div className="space-y-2">
+          <Link
+            href="/"
+            className="inline-flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground"
+          >
+            <ArrowLeft className="h-4 w-4" />
+            All videos
+          </Link>
+          <div className="flex items-start justify-between gap-4">
+            <h1 className="text-2xl font-semibold tracking-tight">{video.name}</h1>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+              onClick={() => {
+                setDeleteError(null);
+                setConfirmOpen(true);
+              }}
+            >
+              <Trash2 className="h-4 w-4" />
+              Delete
+            </Button>
+          </div>
+        </div>
+        <Dialog open={confirmOpen} onOpenChange={(o) => !deleting && setConfirmOpen(o)}>
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>Delete this video?</DialogTitle>
+              <DialogDescription>
+                This permanently removes the video, its annotations, and the uploaded file.
+                This cannot be undone.
+              </DialogDescription>
+            </DialogHeader>
+            {deleteError && (
+              <div className="text-sm text-destructive">{deleteError}</div>
+            )}
+            <DialogFooter>
+              <DialogClose asChild>
+                <Button variant="outline" disabled={deleting}>
+                  Cancel
+                </Button>
+              </DialogClose>
+              <Button
+                variant="destructive"
+                onClick={handleDelete}
+                disabled={deleting}
+              >
+                {deleting && <Loader2 className="h-4 w-4 animate-spin" />}
+                {deleting ? "Deleting…" : "Delete"}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
         <div className="overflow-hidden rounded-xl border bg-black">
           <video
             ref={videoRef}
             src={playbackUrl}
             controls
             playsInline
+            preload="metadata"
             className="aspect-video w-full bg-black"
             onTimeUpdate={(e) => setCurrentTime(e.currentTarget.currentTime)}
             onLoadedMetadata={(e) => {
               const d = e.currentTarget.duration;
-              if (Number.isFinite(d)) setDuration(d);
+              if (!Number.isFinite(d)) return;
+              setDuration(d);
+              // Backfill duration on the server if upload skipped it for speed.
+              if (!video.durationSeconds || video.durationSeconds <= 0) {
+                fetch(`/api/videos/${video.id}`, {
+                  method: "PATCH",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ durationSeconds: d }),
+                }).catch(() => {});
+              }
             }}
           />
         </div>

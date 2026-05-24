@@ -11,15 +11,16 @@ A full-stack web app for uploading, annotating, and AI-summarizing videos.
 
 | Requirement | Implementation |
 |---|---|
-| Upload from local system | Direct browser → S3 via presigned PUT URL (handles multi-GB) |
+| Upload from local system | Direct browser → S3 **multipart** upload, 16 MiB parts, 4-way parallel, per-part retries, drag-and-drop dropzone |
 | Upload from URL | Stored as reference, played directly from the source |
-| Several-GB videos | Bytes never touch the Next.js server (Vercel 4.5MB body limit bypassed) |
+| Several-GB videos | Bytes never touch the Next.js server; multipart removes the 5 GB single-PUT cap |
 | Video listing | Name, source, duration, upload date, status badge |
-| Detail page | HTML5 player, custom timeline, click-to-seek, playback controls |
+| Detail page | HTML5 player, custom timeline, click-to-seek, playback controls, "All videos" back link |
 | Timestamp annotation | Add note at current playhead → list view + timeline markers |
 | Frame interval annotation | Configurable 1/5/10s slots, auto-generated grid, inline editing |
 | Click annotation → jump | Both timestamp list and timeline markers seek the video |
 | Summary generation | Pluggable LLM (Anthropic / OpenAI / Groq) stitches annotations into chronological prose; provider chosen via `AI_PROVIDER` env var |
+| Delete video | Confirm dialog → removes Prisma row, cascades annotations, deletes the S3 object |
 | **+ Auth** | Google OAuth via NextAuth, per-user data isolation |
 | **+ Dark mode** | `next-themes` class-based toggle with system preference |
 
@@ -28,15 +29,19 @@ A full-stack web app for uploading, annotating, and AI-summarizing videos.
 ## Architecture
 
 ```
-┌────────────┐    1. POST /api/videos/upload-url     ┌──────────────┐
-│            │ ─────────────────────────────────────►│              │
-│   Browser  │    2. PUT presigned URL (bytes)       │   AWS S3     │
-│  (Next.js  │ ─────────────────────────────────────►│              │
-│   client)  │    4. GET presigned URL (streaming)   │              │
-│            │ ◄─────────────────────────────────────│              │
-└─────┬──────┘                                       └──────────────┘
-      │ 3. POST /api/videos {key, name, duration}
-      │ 5+ /api/videos/[id]/annotations, /summary, etc.
+┌────────────┐    1. POST /api/videos/upload/multipart/start   ┌──────────────┐
+│            │ ───────────────────────────────────────────────►│              │
+│            │    2. POST .../sign-part  (per part, N times)   │              │
+│   Browser  │ ───────────────────────────────────────────────►│              │
+│  (Next.js  │    3. PUT presigned part URL × 4 in parallel    │   AWS S3     │
+│   client)  │ ───────────────────────────────────────────────►│              │
+│            │    4. POST .../complete  (assemble parts)       │              │
+│            │ ───────────────────────────────────────────────►│              │
+│            │    6. GET presigned URL (streaming playback)    │              │
+│            │ ◄───────────────────────────────────────────────│              │
+└─────┬──────┘                                                 └──────────────┘
+      │ 5. POST /api/videos {key, name, duration}
+      │ 7+ /api/videos/[id]/annotations, /summary, DELETE, etc.
       ▼
 ┌─────────────────┐         ┌──────────────┐         ┌──────────────────────────┐
 │ Next.js App     │────────►│  Postgres    │         │  LLM provider            │
@@ -49,7 +54,7 @@ A full-stack web app for uploading, annotating, and AI-summarizing videos.
    accounts.google.com
 ```
 
-**Critical decision — video bytes never hit the server.** Vercel functions cap request bodies at ~4.5 MB. The browser asks our API for a presigned S3 PUT URL, then uploads directly to S3. Duration is read client-side from the `<video>` element's `loadedmetadata` event. This is what makes several-GB uploads work on Vercel's free tier without a separate upload backend.
+**Critical decision — video bytes never hit the server.** Vercel functions cap request bodies at ~4.5 MB and a single PUT presigned URL caps at 5 GB. The browser opens a multipart upload, asks our API to sign each 16 MiB part, uploads 4 parts in parallel directly to S3, then asks the API to finalize. Each part has its own retry budget; closing the modal mid-upload aborts the multipart upload so S3 doesn't keep paying for orphaned parts. Duration is read client-side (best-effort, bounded) and backfilled on first playback if it couldn't be read in time. This is what makes multi-GB uploads work on Vercel's free tier without a separate upload backend.
 
 **URL uploads** are stored as references — not proxied, not copied. The `<video>` element streams directly from the source. Tradeoff discussed below.
 
@@ -90,21 +95,19 @@ npm run dev                        # http://localhost:3000
 
 Real production gaps in this implementation, not generic "wishlist" items:
 
-1. **Single PUT presigned URL caps at 5 GB.** The "several GB" requirement is met, but a 7 GB upload fails outright. The fix is S3 multipart upload — client splits into chunks, each chunk gets its own presigned URL, then a `CompleteMultipartUpload` stitches them. 
+1. **No transcoding — Safari will choke on non-H.264 files.** The `<video>` element plays whatever was uploaded. A `.mov` from an iPhone or a `.webm` from OBS works in Chrome but shows a black frame on Safari. Production would transcode to HLS via AWS MediaConvert (or a self-hosted FFmpeg worker) and serve adaptive bitrate.
 
-2. **No transcoding — Safari will choke on non-H.264 files.** The `<video>` element plays whatever was uploaded. A `.mov` from an iPhone or a `.webm` from OBS works in Chrome but shows a black frame on Safari. Production would transcode to HLS via AWS MediaConvert (or a self-hosted FFmpeg worker) and serve adaptive bitrate.
+2. **URL uploads are stored as references, not copied.** Saves storage and avoids GB-scale server-side downloads, but if the source URL 404s, the video is gone. A production version would async-copy to S3 in the background and flip `status` from `processing` to `ready` when done.
 
-3. **URL uploads are stored as references, not copied.** Saves storage and avoids GB-scale server-side downloads, but if the source URL 404s, the video is gone. A production version would async-copy to S3 in the background and flip `status` from `processing` to `ready` when done.
+3. **Frame-slot annotations re-index when the interval changes.** Slot 3 at a 5s interval represents `0:15`; switch the interval to 10s and slot 3 now points to `0:30`, but the note text doesn't move with the timestamp. The data model stores `slotIndex` but should store `timestamp` as the source of truth and derive `slotIndex` on read.
 
-4. **Frame-slot annotations re-index when the interval changes.** Slot 3 at a 5s interval represents `0:15`; switch the interval to 10s and slot 3 now points to `0:30`, but the note text doesn't move with the timestamp. The data model stores `slotIndex` but should store `timestamp` as the source of truth and derive `slotIndex` on read.
+4. **Delete is best-effort on S3.** The DELETE handler removes the S3 object before the DB row, but if the S3 call throws (creds revoked, transient 5xx) we log and continue so the user isn't stuck with an undeletable row. The worst case is an orphan blob, which a periodic lifecycle sweep can reclaim. The opposite ordering (DB first) would leak orphans even on the happy path.
 
-5. **Orphaned S3 objects on delete.** Prisma cascades the DB rows when a video or user is deleted, but no code deletes the matching S3 object. Churn-heavy accounts leak storage. Fix is either a small cleanup function called from the DELETE route or an S3 lifecycle policy keyed on a "trash" prefix.
-
-6. **Two abuse vectors on the cost-bearing paths.**
-   - `/api/videos/upload-url` issues presigned PUTs with no per-user rate limit, so a user could mint thousands of URLs and upload 5 GB of garbage each — billable S3 cost with no matching DB row. Mitigation: per-user quota + S3 lifecycle rule that deletes unreferenced objects after N hours.
+5. **Two abuse vectors on the cost-bearing paths.**
+   - The upload endpoints (`/api/videos/upload/multipart/*` and the legacy `/api/videos/upload-url`) issue presigned PUTs / part URLs with no per-user rate limit, so a user could mint thousands of URLs and upload garbage — billable S3 cost with no matching DB row. Mitigation: per-user quota + S3 lifecycle rule that deletes unreferenced objects after N hours. The upload modal already calls `multipart/abort` when a user closes mid-upload, but a malicious client can simply not call it.
    - `/api/videos/[id]/summary` calls the LLM with no rate limit. A user spamming "Regenerate" burns API credit. Mitigation: per-user request limiter and/or a "regenerate only if annotations changed" guard.
 
-7. **Summary prompt is unbounded.** All annotations are stitched into one prompt. A long video with 200 annotations easily exceeds the context window on cheaper models, and the summary quality degrades long before that. Production would chunk + map-reduce: summarize each window separately, then summarize the summaries.
+6. **Summary prompt is unbounded.** All annotations are stitched into one prompt. A long video with 200 annotations easily exceeds the context window on cheaper models, and the summary quality degrades long before that. Production would chunk + map-reduce: summarize each window separately, then summarize the summaries.
 
 ---
 
@@ -120,9 +123,14 @@ app/
     auth/[...nextauth]/route.ts       # NextAuth handler
     videos/
       route.ts                        # GET list, POST create
-      upload-url/route.ts             # POST → presigned S3 PUT
+      upload-url/route.ts             # POST → presigned S3 PUT (legacy single-shot path)
+      upload/multipart/
+        start/route.ts                # POST → CreateMultipartUpload, returns uploadId
+        sign-part/route.ts            # POST → presigned UploadPart URL for one partNumber
+        complete/route.ts             # POST → CompleteMultipartUpload (stitches parts)
+        abort/route.ts                # POST → AbortMultipartUpload (cleanup on cancel)
       [id]/
-        route.ts                      # GET / PATCH / DELETE
+        route.ts                      # GET / PATCH / DELETE (DELETE also removes S3 object)
         playback-url/route.ts         # presigned GET for S3, raw URL for external
         annotations/route.ts          # POST (upsert for frame, insert for timestamp)
         annotations/[aid]/route.ts    # DELETE
@@ -132,13 +140,13 @@ components/
   providers.tsx                       # Theme + Session providers
   theme-toggle.tsx                    # Dark mode switch
   user-menu.tsx                       # Avatar + sign out
-  upload-modal.tsx                    # Tabbed file/URL upload
-  video-workspace.tsx                 # Player + annotations + frame slots + summary
+  upload-modal.tsx                    # Tabbed file/URL upload, drag-and-drop dropzone, multipart client
+  video-workspace.tsx                 # Player + annotations + frame slots + summary + back link + delete dialog
   ui/                                 # Hand-rolled shadcn-style primitives
 lib/
   prisma.ts                           # Singleton client
   auth.ts                             # NextAuth config + requireUser() helper
-  s3.ts                               # AWS SDK + presign helpers + key builder
+  s3.ts                               # AWS SDK + presign / multipart / delete helpers + key builder
   ai.ts                               # Pluggable LLM client (Anthropic / OpenAI / Groq)
   api.ts                              # withApi() wrapper + ApiError
   utils.ts                            # cn(), formatDuration(), formatRelativeDate()
